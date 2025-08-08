@@ -63,12 +63,30 @@ def load_data():
             
             df = pd.concat([df, yearly_combined], ignore_index=True).drop_duplicates()
         
+        # Standardize column names
+        if 'Team' in df.columns and 'TEAM' not in df.columns:
+            df = df.rename(columns={'Team': 'TEAM'})
+
+        # Ensure numeric types for key metrics to avoid empty charts and type issues
+        numeric_columns = [
+            'W', 'G', 'ADJOE', 'ADJDE', 'EFG_O', 'EFG_D', 'TOR', 'TORD', 'ORB', 'DRB',
+            'SEED'
+        ]
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
         # Clean and prepare data
-        df['WIN_PCT'] = df['W'] / df['G']
-        df['EFFICIENCY_DIFF'] = df['ADJOE'] - df['ADJDE']
-        
-        # Handle missing values
-        df = df.fillna(0)
+        if 'W' in df.columns and 'G' in df.columns:
+            df['WIN_PCT'] = np.where(df['G'] > 0, df['W'] / df['G'], np.nan)
+        if 'ADJOE' in df.columns and 'ADJDE' in df.columns:
+            df['EFFICIENCY_DIFF'] = df['ADJOE'] - df['ADJDE']
+
+        # Handle missing values conservatively (avoid forcing zeros that break charts)
+        df = df.fillna({
+            'WIN_PCT': 0.0,
+            'EFFICIENCY_DIFF': 0.0
+        })
         
         return df
     except Exception as e:
@@ -104,7 +122,7 @@ def main():
     selected_conferences = st.sidebar.multiselect(
         "Select Conferences",
         options=conferences,
-        default=conferences[:5] if len(conferences) > 5 else conferences,
+        default=conferences,  # default to all to avoid unintentionally hiding teams
         help="Filter by conference"
     )
     
@@ -147,6 +165,7 @@ def main():
         
         # Key metrics row
         st.subheader("📊 Key Performance Indicators")
+        st.caption("KPIs reflect averages across the currently selected teams, conferences, and years.")
         
         col1, col2, col3, col4 = st.columns(4)
         
@@ -164,7 +183,7 @@ def main():
         
         with col4:
             tournament_teams = len(filtered_df[filtered_df['POSTSEASON'].notna()]) if 'POSTSEASON' in filtered_df.columns else 0
-            st.metric("Tournament Teams", tournament_teams)
+            st.metric("Tournament Teams", f"{tournament_teams}")
         
         # Main visualization section
         st.subheader("🎯 Interactive Performance Analysis")
@@ -179,23 +198,34 @@ def main():
             team_col = 'TEAM' if 'TEAM' in filtered_df.columns else 'Team'
             
             # Calculate quadrant lines
-            x_median = filtered_df['ADJDE'].median()
-            y_median = filtered_df['ADJOE'].median()
+            valid_eff_df = filtered_df.dropna(subset=['ADJOE', 'ADJDE']) if set(['ADJOE', 'ADJDE']).issubset(filtered_df.columns) else filtered_df
+            x_median = valid_eff_df['ADJDE'].median() if 'ADJDE' in valid_eff_df.columns else 0
+            y_median = valid_eff_df['ADJOE'].median() if 'ADJOE' in valid_eff_df.columns else 0
             
             # Create base scatter plot
-            click_selection = alt.selection_point()
-            scatter = alt.Chart(filtered_df).mark_circle(size=100).add_params(
-                click_selection
-            ).encode(
-                x=alt.X('ADJDE:Q', title='Defensive Efficiency (lower is better)'),
-                y=alt.Y('ADJOE:Q', title='Offensive Efficiency'),
-                size=alt.Size('W:Q', scale=alt.Scale(range=[50, 400]), title='Wins'),
-                color=alt.Color('CONF:N', title='Conference'),
-                tooltip=[team_col + ':N', 'W:Q', 'G:Q', 'WIN_PCT:Q', 'CONF:N', 'ADJOE:Q', 'ADJDE:Q']
-            ).properties(
-                width=450,
-                height=350,
-                title="Team Efficiency Comparison"
+            brush = alt.selection_interval()
+            conf_select = alt.selection_point(fields=['CONF'], bind='legend')
+            scatter = (
+                alt.Chart(valid_eff_df)
+                .mark_circle(size=100)
+                .add_params(brush, conf_select)
+                .encode(
+                    x=alt.X('ADJDE:Q', title='Defensive Efficiency (lower is better)', scale=alt.Scale(zero=False)),
+                    y=alt.Y('ADJOE:Q', title='Offensive Efficiency', scale=alt.Scale(zero=False)),
+                    size=alt.Size('W:Q', scale=alt.Scale(range=[50, 400]), title='Wins'),
+                    color=alt.Color('CONF:N', title='Conference'),
+                    opacity=alt.condition(brush & conf_select, alt.value(0.9), alt.value(0.25)),
+                    tooltip=[
+                        alt.Tooltip(f'{team_col}:N', title='Team'),
+                        alt.Tooltip('CONF:N', title='Conference'),
+                        alt.Tooltip('W:Q', title='Wins', format=',d'),
+                        alt.Tooltip('G:Q', title='Games', format=',d'),
+                        alt.Tooltip('WIN_PCT:Q', title='Win %', format='.1%'),
+                        alt.Tooltip('ADJOE:Q', title='Off Eff', format='.1f'),
+                        alt.Tooltip('ADJDE:Q', title='Def Eff', format='.1f'),
+                    ],
+                )
+                .properties(width=450, height=350, title="Team Efficiency Comparison")
             )
             
             # Add quadrant lines
@@ -208,7 +238,7 @@ def main():
             ).encode(y='y:Q')
             
             # Combine charts
-            chart1 = scatter + v_line + h_line
+            chart1 = (scatter + v_line + h_line).interactive()
             
             st.altair_chart(chart1, use_container_width=True)
         
@@ -223,16 +253,27 @@ def main():
                     y_field = 'SEED' if 'SEED' in tournament_df.columns else 'W'
                     y_title = 'Tournament Seed (lower is better)' if 'SEED' in tournament_df.columns else 'Wins'
                     
-                    chart2 = alt.Chart(tournament_df).mark_circle(size=100).encode(
-                        x=alt.X('EFFICIENCY_DIFF:Q', title='Efficiency Differential'),
-                        y=alt.Y(f'{y_field}:Q', title=y_title, sort='descending' if y_field == 'SEED' else 'ascending'),
-                        color=alt.Color('POSTSEASON:N', title='Tournament Result'),
-                        size=alt.Size('W:Q', scale=alt.Scale(range=[50, 300]), title='Wins'),
-                        tooltip=[team_col + ':N', 'ADJOE:Q', 'ADJDE:Q', 'W:Q', 'CONF:N', 'POSTSEASON:N']
-                    ).properties(
-                        width=450,
-                        height=350,
-                        title="Tournament Performance vs Efficiency"
+                    chart2 = (
+                        alt.Chart(tournament_df)
+                        .transform_filter(brush)
+                        .transform_filter(conf_select)
+                        .mark_circle(size=100)
+                        .encode(
+                            x=alt.X('EFFICIENCY_DIFF:Q', title='Efficiency Differential', scale=alt.Scale(zero=False)),
+                            y=alt.Y(f'{y_field}:Q', title=y_title, sort='descending' if y_field == 'SEED' else 'ascending'),
+                            color=alt.Color('POSTSEASON:N', title='Tournament Result'),
+                            size=alt.Size('W:Q', scale=alt.Scale(range=[50, 300]), title='Wins'),
+                            tooltip=[
+                                alt.Tooltip(f'{team_col}:N', title='Team'),
+                                alt.Tooltip('CONF:N', title='Conference'),
+                                alt.Tooltip('POSTSEASON:N', title='Result'),
+                                alt.Tooltip('W:Q', title='Wins', format=',d'),
+                                alt.Tooltip('ADJOE:Q', title='Off Eff', format='.1f'),
+                                alt.Tooltip('ADJDE:Q', title='Def Eff', format='.1f'),
+                                alt.Tooltip('EFFICIENCY_DIFF:Q', title='Eff Diff', format='.1f'),
+                            ],
+                        )
+                        .properties(width=450, height=350, title="Tournament Performance vs Efficiency")
                     )
                     
                     st.altair_chart(chart2, use_container_width=True)
@@ -241,10 +282,10 @@ def main():
             else:
                 # Alternative visualization - Win percentage distribution
                 chart2 = alt.Chart(filtered_df).mark_bar().encode(
-                    x=alt.X('WIN_PCT:Q', bin=alt.Bin(maxbins=20), title='Win Percentage'),
+                    x=alt.X('WIN_PCT:Q', bin=alt.Bin(maxbins=20), title='Win Percentage', axis=alt.Axis(format='.0%')),
                     y=alt.Y('count():Q', title='Number of Teams'),
                     color=alt.Color('CONF:N', title='Conference'),
-                    tooltip=['count():Q', 'CONF:N']
+                    tooltip=[alt.Tooltip('count():Q', title='Teams'), alt.Tooltip('CONF:N', title='Conference')]
                 ).properties(
                     width=450,
                     height=350,
@@ -275,17 +316,21 @@ def main():
                 # Sort by selected metric
                 conf_stats = conf_stats.sort_values(metric_options[selected_metric], ascending=False)
                 
-                chart3 = alt.Chart(conf_stats).mark_bar().encode(
-                    x=alt.X('CONF:N', title='Conference', sort='-y'),
-                    y=alt.Y(f'{metric_options[selected_metric]}:Q', title=f'Average {selected_metric}'),
-                    color=alt.Color(f'{metric_options[selected_metric]}:Q', 
-                                  scale=alt.Scale(scheme='viridis'), 
-                                  title=f'Avg {selected_metric}'),
-                    tooltip=['CONF:N', f'{metric_options[selected_metric]}:Q', 'WIN_PCT:Q', 'W:Q']
-                ).properties(
-                    width=450,
-                    height=350,
-                    title=f"Conference Rankings by {selected_metric}"
+                chart3 = (
+                    alt.Chart(conf_stats)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X('CONF:N', title='Conference', sort='-y'),
+                        y=alt.Y(f'{metric_options[selected_metric]}:Q', title=f'Average {selected_metric}'),
+                        color=alt.Color('CONF:N', title='Conference'),
+                        tooltip=[
+                            alt.Tooltip('CONF:N', title='Conference'),
+                            alt.Tooltip(f'{metric_options[selected_metric]}:Q', title=f'Avg {selected_metric}', format='.2f' if metric_options[selected_metric] != 'WIN_PCT' else '.1%'),
+                            alt.Tooltip('WIN_PCT:Q', title='Avg Win %', format='.1%'),
+                            alt.Tooltip('W:Q', title='Avg Wins', format='.1f'),
+                        ],
+                    )
+                    .properties(width=450, height=350, title=f"Conference Rankings by {selected_metric}")
                 )
                 
                 st.altair_chart(chart3, use_container_width=True)
@@ -302,8 +347,16 @@ def main():
                     y=alt.Y('ADJDE:Q', title='Defensive Efficiency (lower is better)', sort='descending'),
                     color=alt.Color('CONF:N', title='Conference'),
                     size=alt.Size('W:Q', scale=alt.Scale(range=[100, 400]), title='Wins'),
-                    tooltip=[f'{team_col}:N', 'Rank:O', 'CONF:N', 'W:Q', 'WIN_PCT:Q', 
-                            'ADJOE:Q', 'ADJDE:Q', f'{metric_options[selected_metric]}:Q']
+                    tooltip=[
+                        alt.Tooltip(f'{team_col}:N', title='Team'),
+                        alt.Tooltip('Rank:O', title='Rank'),
+                        alt.Tooltip('CONF:N', title='Conference'),
+                        alt.Tooltip('W:Q', title='Wins', format=',d'),
+                        alt.Tooltip('WIN_PCT:Q', title='Win %', format='.1%'),
+                        alt.Tooltip('ADJOE:Q', title='Off Eff', format='.1f'),
+                        alt.Tooltip('ADJDE:Q', title='Def Eff', format='.1f'),
+                        alt.Tooltip(f'{metric_options[selected_metric]}:Q', title=selected_metric, format='.2f' if metric_options[selected_metric] != 'WIN_PCT' else '.1%'),
+                    ]
                 ).properties(
                     width=450,
                     height=350,
@@ -323,9 +376,17 @@ def main():
         
         # Team comparison section
         st.subheader("⚖️ Team Comparison Tool")
+
+        st.caption("Tip: Use the checkbox below to select teams from all conferences/years if you can't find a team in the current filters.")
         
         # Team selector for comparison
-        available_teams = sorted(filtered_df[team_col].unique())
+        use_global_teams = st.checkbox(
+            "Select teams from all conferences/years",
+            value=False,
+            help="When enabled, the team list ignores the conference filter and includes teams across the selected years."
+        )
+        teams_source_df = df if use_global_teams else filtered_df
+        available_teams = sorted(teams_source_df[team_col].unique()) if team_col in teams_source_df.columns else []
         
         col1, col2 = st.columns(2)
         
@@ -346,7 +407,7 @@ def main():
             )
         
         if selected_teams_compare and comparison_metrics:
-            comparison_df = filtered_df[filtered_df[team_col].isin(selected_teams_compare)]
+            comparison_df = teams_source_df[teams_source_df[team_col].isin(selected_teams_compare)]
             
             # Create normalized comparison data for better visualization
             comparison_data = []
@@ -370,7 +431,11 @@ def main():
                 y=alt.Y('Value:Q', title='Metric Value'),
                 color=alt.Color('Team:N', title='Team'),
                 column=alt.Column('Team:N', title='Team Comparison'),
-                tooltip=['Team:N', 'Metric:N', 'Value:Q']
+                tooltip=[
+                    alt.Tooltip('Team:N', title='Team'),
+                    alt.Tooltip('Metric:N', title='Metric'),
+                    alt.Tooltip('Value:Q', title='Value', format='.2f'),
+                ]
             ).properties(
                 width=120,
                 height=300,
@@ -380,6 +445,20 @@ def main():
             )
             
             st.altair_chart(chart5, use_container_width=True)
+
+        with st.expander("What do the metric abbreviations mean?"):
+            st.markdown(
+                "- ADJOE: Adjusted Offensive Efficiency (points scored per 100 possessions, adjusted)\n"
+                "- ADJDE: Adjusted Defensive Efficiency (points allowed per 100 possessions, adjusted; lower is better)\n"
+                "- EFG_O: Offensive Effective Field Goal %\n"
+                "- EFG_D: Defensive Effective Field Goal % (lower is better)\n"
+                "- TOR: Offensive Turnover Rate (lower is better)\n"
+                "- TORD: Defensive Turnover Rate\n"
+                "- ORB: Offensive Rebound Rate\n"
+                "- DRB: Defensive Rebound Rate\n"
+            )
+
+        st.caption("Note: Data coverage varies by year; some Division I programs may be missing if source data was unavailable.")
         
         # Data table with sorting and filtering
         st.subheader("📋 Detailed Team Statistics")
@@ -414,8 +493,13 @@ def main():
         display_df = display_df.sort_values(by=sort_column, ascending=ascending)
         
         # Display with highlighting
+        # Format percentages for display without affecting sorting above
+        display_df_fmt = display_df.copy()
+        if 'WIN_PCT' in display_df_fmt.columns:
+            display_df_fmt['WIN_PCT'] = display_df_fmt['WIN_PCT'].apply(lambda x: f"{x:.1%}")
+
         st.dataframe(
-            display_df,
+            display_df_fmt,
             use_container_width=True,
             height=400,
             hide_index=True
